@@ -1,0 +1,272 @@
+name: build-unsigned-legacypaddisplay
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_15.4.app/Contents/Developer
+      UPSTREAM_SHA: 16c5421e5b8c8a97f0d1247900585f0e417b45f4
+      EXPECTED_XCODE_BUILD: 15F31d
+
+    steps:
+      - name: Checkout pinned source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: cuongpham1/ipad-iphone-second-monitor-ios12-free
+          ref: 16c5421e5b8c8a97f0d1247900585f0e417b45f4
+          submodules: false
+          persist-credentials: false
+          path: src
+
+      - name: Verify toolchain and source
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "WORKFLOW: ${GITHUB_WORKFLOW_REF} @ ${GITHUB_SHA}"
+
+          test -d "$DEVELOPER_DIR"
+
+          echo "SOURCE COMMIT:"
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "$UPSTREAM_SHA"
+
+          echo "SOURCE TREE:"
+          git rev-parse 'HEAD^{tree}'
+
+          echo "SUBMODULE STATUS (must start with '-'):"
+          SUBMODULE_STATUS="$(git submodule status)"
+          echo "$SUBMODULE_STATUS"
+          grep -q '^-' <<<"$SUBMODULE_STATUS"
+
+          echo "MACOS:"
+          sw_vers
+          case "$(sw_vers -productVersion)" in
+            14.*) ;;
+            *) echo "ERROR: expected macOS 14.x"; exit 1 ;;
+          esac
+
+          echo "XCODE:"
+          XV="$(xcodebuild -version)"
+          echo "$XV"
+          grep -q "Build version ${EXPECTED_XCODE_BUILD}" <<<"$XV"
+
+          P="iOS/LegacyPadDisplay.xcodeproj/project.pbxproj"
+
+          echo "PROJECT FORMAT:"
+          grep -nE 'objectVersion|preferredProjectObjectVersion' "$P"
+
+          echo "PROJECT CONTENT GUARD:"
+          if grep -qE 'PBXShellScriptBuildPhase|XCRemoteSwiftPackageReference|XCLocalSwiftPackageReference|PBXFileSystemSynchronized' "$P"; then
+            echo "ERROR: unexpected script phase, package reference or synchronized group"
+            exit 1
+          fi
+
+          echo "OK: no script phase, no package reference, no synchronized group"
+
+      - name: Prepare Xcode 15 compatible project copy
+        working-directory: src/iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          P="LegacyPadDisplay.xcodeproj/project.pbxproj"
+
+          test "$(grep -c 'objectVersion = 77;' "$P")" = "1"
+
+          sed -i '' \
+            's/objectVersion = 77;/objectVersion = 60;/' \
+            "$P"
+
+          test "$(grep -c 'objectVersion = 60;' "$P")" = "1"
+          grep -q 'preferredProjectObjectVersion = 77;' "$P"
+
+          echo "PATCH:"
+          git diff -- "$P"
+
+          test "$(git diff --numstat -- "$P")" = \
+            "$(printf '1\t1\tiOS/%s' "$P")"
+
+          echo "PROJECT PARSE TEST:"
+          xcodebuild \
+            -list \
+            -project LegacyPadDisplay.xcodeproj
+
+      - name: Build unsigned device application
+        working-directory: src/iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcodebuild \
+            -project LegacyPadDisplay.xcodeproj \
+            -target LegacyPadDisplay \
+            -configuration Release \
+            -sdk iphoneos \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            SYMROOT="$RUNNER_TEMP/sym" \
+            OBJROOT="$RUNNER_TEMP/obj" \
+            build
+
+      - name: Inspect unsigned application
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="$RUNNER_TEMP/sym/Release-iphoneos/LegacyPadDisplay.app"
+          BIN="$APP/LegacyPadDisplay"
+          PB=/usr/libexec/PlistBuddy
+
+          test -d "$APP"
+          test -f "$BIN"
+
+          echo "FILE:"
+          file "$BIN"
+
+          echo "ARCHITECTURE:"
+          LI="$(lipo -info "$BIN")"
+          echo "$LI"
+          grep -qE 'Non-fat file: .* is architecture: arm64$' <<<"$LI"
+
+          echo "MACH-O BUILD TARGET:"
+          otool -l "$BIN" | grep -A6 -E \
+            'LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS'
+
+          echo "RPATH:"
+          otool -l "$BIN" | grep -A2 'LC_RPATH' || \
+            echo "No LC_RPATH found"
+
+          echo "BINARY DEPENDENCIES:"
+          otool -L "$BIN"
+
+          echo "INFO.PLIST:"
+          for K in \
+            CFBundleIdentifier \
+            CFBundleExecutable \
+            MinimumOSVersion \
+            DTPlatformName \
+            DTSDKName \
+            DTXcodeBuild
+          do
+            printf '%s = %s\n' \
+              "$K" \
+              "$("$PB" -c "Print :$K" "$APP/Info.plist")"
+          done
+
+          test "$("$PB" -c 'Print :MinimumOSVersion' "$APP/Info.plist")" = "12.0"
+          test "$("$PB" -c 'Print :CFBundleExecutable' "$APP/Info.plist")" = "LegacyPadDisplay"
+          test "$("$PB" -c 'Print :DTPlatformName' "$APP/Info.plist")" = "iphoneos"
+          test "$("$PB" -c 'Print :DTXcodeBuild' "$APP/Info.plist")" = "$EXPECTED_XCODE_BUILD"
+
+          echo "EMBEDDED FRAMEWORKS / DYLIBS:"
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -maxdepth 1 -print | sort
+          else
+            echo "No Frameworks directory"
+          fi
+
+          echo "APP CONTENTS:"
+          find "$APP" -maxdepth 2 -print | sort
+
+          echo "SIGNING CHECK:"
+          test ! -d "$APP/_CodeSignature"
+          test ! -e "$APP/embedded.mobileprovision"
+
+          if SIGINFO="$(codesign -dvv "$BIN" 2>&1)"; then
+            echo "$SIGINFO"
+
+            if grep -q 'Authority=' <<<"$SIGINFO"; then
+              echo "ERROR: executable is signed with a certificate identity"
+              exit 1
+            fi
+
+            if grep -q 'linker-signed' <<<"$SIGINFO"; then
+              echo "NOTE: linker ad-hoc signature only; acceptable for resign"
+            else
+              echo "ERROR: unexpected signature state"
+              exit 1
+            fi
+          else
+            echo "$SIGINFO"
+            grep -q 'not signed at all' <<<"$SIGINFO"
+            echo "OK: executable is unsigned"
+          fi
+
+          echo "BINARY SHA256:"
+          shasum -a 256 "$BIN"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="$RUNNER_TEMP/sym/Release-iphoneos/LegacyPadDisplay.app"
+          PKG="$RUNNER_TEMP/pkg"
+
+          mkdir -p "$PKG/Payload"
+          ditto "$APP" "$PKG/Payload/LegacyPadDisplay.app"
+
+          cd "$PKG"
+
+          /usr/bin/zip \
+            -qry \
+            LegacyPadDisplay-unsigned.ipa \
+            Payload
+
+          unzip -Z1 LegacyPadDisplay-unsigned.ipa \
+            > "$RUNNER_TEMP/ipa-list.txt"
+
+          grep -qx \
+            'Payload/LegacyPadDisplay.app/LegacyPadDisplay' \
+            "$RUNNER_TEMP/ipa-list.txt"
+
+          if grep -qv '^Payload/' "$RUNNER_TEMP/ipa-list.txt"; then
+            echo "ERROR: entries outside Payload/"
+            exit 1
+          fi
+
+          if grep -qE \
+            '(^|/)(embedded\.mobileprovision|_CodeSignature/)' \
+            "$RUNNER_TEMP/ipa-list.txt"
+          then
+            echo "ERROR: signing material present in IPA"
+            exit 1
+          fi
+
+          echo "SHA256:"
+          shasum -a 256 \
+            LegacyPadDisplay-unsigned.ipa | \
+            tee LegacyPadDisplay-unsigned.ipa.sha256
+
+          {
+            echo "### LegacyPadDisplay unsigned IPA"
+            echo ""
+            echo "- Workflow commit: \`${GITHUB_SHA}\`"
+            echo "- Upstream commit: \`${UPSTREAM_SHA}\`"
+            echo "- Xcode build: \`${EXPECTED_XCODE_BUILD}\`"
+            echo "- IPA SHA-256: \`$(cut -d' ' -f1 LegacyPadDisplay-unsigned.ipa.sha256)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: LegacyPadDisplay-unsigned
+          path: |
+            ${{ runner.temp }}/pkg/LegacyPadDisplay-unsigned.ipa
+            ${{ runner.temp }}/pkg/LegacyPadDisplay-unsigned.ipa.sha256
+          if-no-files-found: error
+          retention-days: 7
