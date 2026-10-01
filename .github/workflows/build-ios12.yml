@@ -114,6 +114,8 @@ jobs:
             -sdk iphoneos \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
+            IPHONEOS_DEPLOYMENT_TARGET=12.2 \
+            ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES=NO \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -167,7 +169,7 @@ jobs:
               "$("$PB" -c "Print :$K" "$APP/Info.plist")"
           done
 
-          test "$("$PB" -c 'Print :MinimumOSVersion' "$APP/Info.plist")" = "12.0"
+          test "$("$PB" -c 'Print :MinimumOSVersion' "$APP/Info.plist")" = "12.2"
           test "$("$PB" -c 'Print :CFBundleExecutable' "$APP/Info.plist")" = "LegacyPadDisplay"
           test "$("$PB" -c 'Print :DTPlatformName' "$APP/Info.plist")" = "iphoneos"
           test "$("$PB" -c 'Print :DTXcodeBuild' "$APP/Info.plist")" = "$EXPECTED_XCODE_BUILD"
